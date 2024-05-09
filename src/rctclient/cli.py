@@ -52,20 +52,16 @@ def cli(ctx, debug: bool, frame_debug: bool) -> None:
     log.info('rctclient CLI starting')
 
 
-def autocomplete_registry_name(*args, **kwargs) -> List[str]:  # pylint: disable=unused-argument
+def autocomplete_registry_name(_ctx, _args: List, incomplete: str) -> List[str]:
     '''
     Provides autocompletion for the object IDs name parameter.
 
+    :param _ctx: Click context (ignored).
+    :param _args: Arguments (ignored).
+    :param incomplete: Incomplete (or empty) string from the user.
     :return: A list of names that either start with `incomplete` or all if `incomplete` is empty.
     '''
-    if 'incomplete' not in kwargs:
-        kwargs['incomplete'] = ''
-    return R.prefix_complete_name(kwargs['incomplete'])
-
-if click.__version__ >= '8.1.0':
-    autocomp_registry = {'shell_complete': autocomplete_registry_name}
-else:
-    autocomp_registry = {'autocompletion': autocomplete_registry_name}
+    return R.prefix_complete_name(incomplete)
 
 
 def receive_frame(sock: socket.socket, timeout: int = 2) -> ReceiveFrame:
@@ -106,7 +102,8 @@ def receive_frame(sock: socket.socket, timeout: int = 2) -> ReceiveFrame:
 @click.option('-h', '--host', required=True, type=click.STRING, help='Host address or IP of the device',
               metavar='<host>')
 @click.option('-i', '--id', type=click.STRING, help='Object ID to query, of the form "0xXXXX"', metavar='<ID>')
-@click.option('-n', '--name', help='Object name to query', type=click.STRING, metavar='<name>', **autocomp_registry)
+@click.option('-n', '--name', help='Object name to query', type=click.STRING, metavar='<name>',
+              autocompletion=autocomplete_registry_name)
 @click.option('-v', '--verbose', is_flag=True, default=False, help='Enable verbose output')
 def read_value(ctx, port: int, host: str, id: Optional[str], name: Optional[str], verbose: bool) -> None:
     '''
@@ -177,6 +174,139 @@ def read_value(ctx, port: int, host: str, id: Optional[str], name: Optional[str]
                              payload=encode_value(DataType.INT32, int(datetime.now().timestamp()))))
     else:
         sock.send(make_frame(command=Command.READ, id=oinfo.object_id))
+    try:
+        rframe = receive_frame(sock)
+    except FrameCRCMismatch as exc:
+        log.error('Received frame CRC mismatch: received 0x%X but calculated 0x%X',
+                  exc.received_crc, exc.calculated_crc)
+        sys.exit(1)
+    except InvalidCommand:
+        log.error('Received an unexpected/invalid command in response')
+        sys.exit(1)
+    except FrameLengthExceeded:
+        log.error('Parser overshot, cannot recover frame')
+        sys.exit(1)
+
+    log.debug('Got frame: %s', rframe)
+    if rframe.id != oinfo.object_id:
+        log.error('Received unexpected frame, ID is 0x%X, expected 0x%X', rframe.id, oinfo.object_id)
+        sys.exit(1)
+
+    if is_ts or is_ev:
+        _, table = decode_value(oinfo.response_data_type, rframe.data)
+        if is_ts:
+            value = ', '.join({f'{k:%Y-%m-%dT%H:%M:%S}={v:.4f}' for k, v in table.items()})
+        else:
+            value = ''
+            for entry in table.values():
+                e2 = f'0x{entry.element2:x}' if entry.element2 is not None else ''
+                e3 = f'0x{entry.element3:x}' if entry.element3 is not None else ''
+                e4 = f'0x{entry.element4:x}' if entry.element4 is not None else ''
+                value += f'0x{entry.entry_type:x},{entry.timestamp:%Y-%m-%dT%H:%M:%S},{e2},{e3},{e4}\n'
+    else:
+        # hexdump if the data type is now known
+        if oinfo.response_data_type == DataType.UNKNOWN:
+            value = '0x' + rframe.data.hex()
+        else:
+            value = decode_value(oinfo.response_data_type, rframe.data)
+
+    if verbose:
+        description = oinfo.description if oinfo.description is not None else ''
+        unit = oinfo.unit if oinfo.unit is not None else ''
+        click.echo(f'#{oinfo.index:3} 0x{oinfo.object_id:8X} {oinfo.name:{R.name_max_length()}} '
+                   f'{description:75} {value} {unit}')
+    else:
+        click.echo(f'{value}')
+
+    try:
+        sock.close()
+    except Exception as exc:  # pylint: disable=broad-except
+        log.error('Exception when disconnecting from the host: %s', str(exc))
+    sys.exit(0)
+
+
+@cli.command('write-value')
+@click.pass_context
+@click.option('-p', '--port', default=8899, type=click.INT, help='Port at which the device listens, default 8899',
+              metavar='<port>')
+@click.option('-h', '--host', required=True, type=click.STRING, help='Host address or IP of the device',
+              metavar='<host>')
+@click.option('-i', '--id', type=click.STRING, help='Object ID to query, of the form "0xXXXX"', metavar='<ID>')
+@click.option('-n', '--name', help='Object name to query', type=click.STRING, metavar='<name>',
+              autocompletion=autocomplete_registry_name)
+@click.option('-f', '--value', default=1.00, help='Value to write', type=click.FLOAT, metavar='<value>')
+@click.option('-v', '--verbose', is_flag=True, default=False, help='Enable verbose output')
+def write_value(ctx, port: int, host: str, id: Optional[str], name: Optional[str], value: Optional[float], verbose: bool) -> None:
+    '''
+    Sends a write request. The request is sent to the target "<host>" on the given "<port>" (default: 8899), the
+    response is returned on stdout. Without "verbose" set, the value is returned on standard out, otherwise more
+    information about the object is printed with the value.
+
+    Specify either "--id <id>" or "--name <name>". The ID must be in th decimal notation, such as "0x959930BF", the
+    name must exactly match the name of a known object ID such as "battery.soc".
+
+    The "<name>" option supports shell autocompletion (if installed).
+
+    If "--debug" is set, log output is sent to stderr, so the value can be read from stdout while still catching
+    everything else on stderr.
+
+    Timeseries data and the event table will be queried using the current time. Note that the device may send an
+    arbitrary amount of data. For time series data, The output will be a list of "timestamp=value" pairs separated by a
+    comma, the timestamps are in isoformat, and they are not altered or timezone-corrected but passed from the device
+    as-is. Likewise for event table entries, but their values are printed in hexadecimal.
+
+    Examples:
+
+    \b
+    rctclient read-value --host 192.168.0.1 --name temperature.sink_temp_power_reduction
+    rctclient read-value --host 192.168.0.1 --id 0x90B53336
+    \f
+    :param ctx: Click context
+    :param port: The port number.
+    :param host: The hostname or IP address, passed to ``socket.connect``.
+    :param id: The ID to query. Mutually exclusive with `name`.
+    :param name: The name to query. Mutually exclusive with `id`.
+    :param verbose: Prints more information if `True`, or just the value if `False`.
+    '''
+    if (id is None and name is None) or (id is not None and name is not None):
+        log.error('Please specify either --id or --name', err=True)
+        sys.exit(1)
+
+    if name != 'buf_v_control.power_reduction':
+        print('Only buf_v_control.power_reduction')
+        sys.exit(1)
+
+    if 0.0 > float(value) < 1.0:
+        print('Value must be high than 0 and low than 1')
+        sys.exit(1)
+
+    try:
+        if id:
+            real_id = int(id[2:], 16)
+            log.debug('Parsed ID: 0x%X', real_id)
+            oinfo = R.get_by_id(real_id)
+            log.debug('Object info by ID: %s', oinfo)
+        elif name:
+            oinfo = R.get_by_name(name)
+            log.debug('Object info by name: %s', oinfo)
+    except KeyError:
+        log.error('Could not find requested id or name')
+        sys.exit(1)
+    except ValueError as exc:
+        log.debug('Invalid --id parameter: %s', str(exc))
+        log.error('Invalid --id parameter, can\'t parse', err=True)
+        sys.exit(1)
+
+    log.debug('Connecting to host')
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, port))
+        log.debug('Connected to %s:%d', host, port)
+    except socket.error as exc:
+        log.error('Could not connect to host: %s', str(exc))
+        sys.exit(1)
+
+    sock.send(make_frame(command=Command.WRITE, id=oinfo.object_id, payload=encode_value(DataType.FLOAT, float(value))))
     try:
         rframe = receive_frame(sock)
     except FrameCRCMismatch as exc:
